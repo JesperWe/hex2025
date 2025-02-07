@@ -1,0 +1,8 @@
+app = "2-hex2025"
+primary_region = "ord"
+swap_size_mb = 1024
+
+[mounts]
+source = "models"
+destination = "/models"
+
