@@ -9,7 +9,7 @@ ARG IMAGE
 
 # Update and upgrade the existing packages 
 RUN apt-get update && apt-get upgrade -y && apt-get install -y --no-install-recommends \
-    python3 git \
+    python3 git wget \
     python3-pip \
     ninja-build \
     libopenblas-dev \
