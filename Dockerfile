@@ -40,4 +40,5 @@ EXPOSE 8000
 
 # Run the server start script
 WORKDIR /app
-CMD ["python3", "app.py"]
+CMD ["tail -f /dev/null"]
+#CMD ["python3", "app.py"]
