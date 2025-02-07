@@ -27,6 +27,9 @@ RUN python3 -m pip install --upgrade pip pytest cmake scikit-build setuptools fa
 
 RUN pip install llama-cpp-python --verbose;
 
+WORKDIR ./models
+RUN wget -q https://huggingface.co/MaziyarPanahi/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct.Q8_0.gguf?download=true
+
 # Set environment variable for the host
 ENV HOST=0.0.0.0
 ENV PORT=8000
@@ -35,4 +38,4 @@ ENV PORT=8000
 EXPOSE 8000
 
 # Run the server start script
-CMD ["/bin/sh", "/app/docker/simple/run.sh"]
+CMD ["python3", "app.py"]
