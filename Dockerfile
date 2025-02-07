@@ -38,4 +38,5 @@ ENV PORT=8000
 EXPOSE 8000
 
 # Run the server start script
+WORKDIR /app
 CMD ["python3", "app.py"]
