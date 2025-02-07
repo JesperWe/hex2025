@@ -29,7 +29,7 @@ RUN pip install llama-cpp-python --verbose
 RUN pip install -r requirements.txt
 
 WORKDIR ./models
-RUN wget -q https://huggingface.co/MaziyarPanahi/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct.Q8_0.gguf?download=true
+RUN wget -q https://huggingface.co/MaziyarPanahi/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct.Q8_0.gguf
 
 # Set environment variable for the host
 ENV HOST=0.0.0.0
@@ -40,5 +40,5 @@ EXPOSE 8000
 
 # Run the server start script
 WORKDIR /app
-CMD ["tail -f /dev/null"]
-#CMD ["python3", "app.py"]
+#CMD ["tail", "-f", "/dev/null"]
+CMD ["python3", "app.py"]
