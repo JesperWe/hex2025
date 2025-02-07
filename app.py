@@ -1,7 +1,5 @@
 import os
 from pathlib import Path
-from dotenv import load_dotenv
-_ = load_dotenv()
 from langgraph.graph import StateGraph, END
 from typing import TypedDict, Annotated, List, Dict, Any
 from langchain_core.messages import AnyMessage, SystemMessage, HumanMessage, ToolMessage, AIMessage
