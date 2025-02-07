@@ -26,7 +26,7 @@ RUN python3 -m pip install --upgrade pip
 RUN python3 -m pip install --upgrade pip pytest cmake scikit-build setuptools fastapi uvicorn sse-starlette pydantic-settings starlette-context
 
 RUN pip install llama-cpp-python --verbose
-RUN pip install -f requirements.txt
+RUN pip install requirements.txt
 
 WORKDIR ./models
 RUN wget -q https://huggingface.co/MaziyarPanahi/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct.Q8_0.gguf?download=true
