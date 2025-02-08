@@ -9,7 +9,7 @@ from langchain.callbacks.streaming_stdout import StreamingStdOutCallbackHandler
 import re
 from langgraph.checkpoint.sqlite import SqliteSaver
 from uuid import uuid4
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from argparse import ArgumentParser
 import json
 import requests
@@ -22,8 +22,156 @@ import asyncio
 from queue import Queue
 import threading
 from fastapi.websockets import WebSocketState
+from aiohttp import ClientSession, WSMsgType
+import time
+from starlette.websockets import WebSocketDisconnect
+
+class WeatherData(BaseModel):
+    fogDensity: float = Field(0.0015, ge=0.001, le=0.006)
+    cameraPosition: Dict[str, float] = Field(default_factory=lambda: {"x": 0, "y": 0, "z": 1})
+    cameraRotation: Dict[str, float] = Field(default_factory=lambda: {"x": 1.16, "y": -0.12, "z": 0.27})
+    ambientLightIntensity: float = Field(0.1, ge=0.1, le=100)
+    directionalLightIntensity: float = Field(50, ge=0, le=50)
+    flashColor: int = Field(0x062d89)
+    flashIntensity: float = Field(30, ge=0, le=100)
+    flashDistance: float = Field(10, ge=0, le=100)
+    flashDecay: float = Field(1.7, ge=0, le=5)
+    rainCount: int = Field(10000, ge=0, le=10000)
+    rainColor: int = Field(0xaaaaaa)
+    rainSize: float = Field(0.1, ge=0.1, le=1.0)
+    cloudOpacity: float = Field(1, ge=0, le=1)
+    cloudCount: int = Field(25, ge=0, le=200)
+    skyColor: int = Field(0x87ceeb)
+    cloudColor: int = Field(0xffffff)
 
 class DataTransmissionManager:
+    def __init__(self):
+        self.app = FastAPI()
+        self.setup_cors()
+        self.setup_static()
+        self.latest_data = WeatherData()
+        self.active_connections: List[WebSocket] = []
+        self.lock = asyncio.Lock()
+        self.setup_routes()
+
+    def setup_cors(self):
+        self.app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+
+    def setup_static(self):
+        static_dir = Path("static")
+        static_dir.mkdir(exist_ok=True)
+        self.app.mount("/static", StaticFiles(directory="static"), name="static")
+
+    def setup_routes(self):
+        @self.app.get("/health")
+        async def health_check():
+            return {"status": "ok", "timestamp": datetime.now().isoformat()}
+
+        @self.app.get("/latest")
+        async def get_latest_data():
+            # Convert Pydantic model to dict using model_dump
+            return self.latest_data.model_dump()
+
+        @self.app.websocket("/ws")
+        async def websocket_endpoint(websocket: WebSocket):
+            await websocket.accept()
+            self.active_connections.append(websocket)
+            try:
+                # Use model_dump for initial state
+                await websocket.send_json(WeatherData().model_dump())
+                while True:
+                    try:
+                        await websocket.receive_text()
+                    except WebSocketDisconnect:
+                        break
+            except WebSocketDisconnect:
+                pass
+            except Exception as e:
+                print(f"WebSocket error: {e}")
+            finally:
+                # Safe removal check
+                if websocket in self.active_connections:
+                    self.active_connections.remove(websocket)
+
+    async def send_data(self, data: Dict[str, Any]):
+        """Lock-free update with atomic operations"""
+        try:
+            # Use model_dump instead of dict
+            weather_data = WeatherData(**data).model_dump()
+
+            # Atomic state update
+            old_connections, self.active_connections = self.active_connections, self.active_connections.copy()
+            self.latest_data = weather_data
+            self.save_data(weather_data)  # I/O bound but thread-safe
+
+            # Fire-and-forget broadcast
+            asyncio.create_task(
+                self._bulk_send(old_connections, weather_data)
+            )
+        except Exception as e:
+            print(f"Send error: {e}")
+
+    async def _bulk_send(self, connections: List[WebSocket], data: dict):
+        """Parallel send to connection snapshot"""
+        await asyncio.gather(
+            *[self._safe_send(conn, data) for conn in connections],
+            return_exceptions=True
+        )
+
+    async def _safe_send(self, conn: WebSocket, data: dict):
+        """Non-blocking send with automatic cleanup"""
+        try:
+            if conn.client_state == WebSocketState.CONNECTED:
+                await conn.send_json(data)
+        except Exception as e:
+            print(f"Connection error: {e}")
+        finally:
+            if conn in self.active_connections:
+                self.active_connections.remove(conn)
+
+    def save_data(self, data: Dict[str, Any]):
+        """Save data to file system with error handling"""
+        try:
+            data_dir = Path("data")
+            data_dir.mkdir(exist_ok=True)
+
+            # Save as latest.json
+            with open(data_dir / "latest.json", 'w') as f:
+                json.dump(data, f, indent=2)
+
+            # Save timestamped version
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            with open(data_dir / f"weather_data_{timestamp}.json", 'w') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            print(f"Error saving data: {e}")
+            raise
+
+    def run_server(self):
+        """Run the FastAPI server"""
+        import uvicorn
+        uvicorn.run(self.app, host="0.0.0.0", port=8000)
+
+    def start(self):
+        """Start the server in a separate thread"""
+        import threading
+        server_thread = threading.Thread(target=self.run_server)
+        server_thread.daemon = True
+        server_thread.start()
+
+
+###########
+
+
+
+
+class _DataTransmissionManager:
     def __init__(self):
         self.app = FastAPI()
         self.setup_cors()
@@ -70,15 +218,21 @@ class DataTransmissionManager:
             await websocket.accept()
             self.active_connections.append(websocket)
             try:
-                # Initial send of current data
-                await websocket.send_json(self.latest_data)
+                # Use model_dump for initial state
+                await websocket.send_json(WeatherData().model_dump())
                 while True:
-                    # Wait for new data instead of sending every second
-                    await asyncio.sleep(0.1)
+                    try:
+                        await websocket.receive_text()
+                    except WebSocketDisconnect:
+                        break
+            except WebSocketDisconnect:
+                pass
             except Exception as e:
                 print(f"WebSocket error: {e}")
             finally:
-                self.active_connections.remove(websocket)
+                # Safe removal check
+                if websocket in self.active_connections:
+                    self.active_connections.remove(websocket)
 
         @self.app.get("/latest")
         async def get_latest_data():
@@ -87,18 +241,24 @@ class DataTransmissionManager:
     async def send_data(self, data: Dict[str, Any]):
         """Update and broadcast latest data"""
         async with self.lock:
-            # Merge new data with existing values
             self.latest_data = {**self.latest_data, **data}
             self.save_data(self.latest_data)
 
-            # Send to all active connections
+            # Create tasks for all sends and gather results
+            send_tasks = []
             for conn in self.active_connections.copy():
                 try:
-                    if conn.application_state == WebSocketState.CONNECTED:
-                        await conn.send_json(self.latest_data)
+                    if conn.client_state == WebSocketState.CONNECTED:
+                        send_tasks.append(conn.send_json(self.latest_data))
+                    else:
+                        self.active_connections.remove(conn)
                 except Exception as e:
-                    print(f"Error sending data: {e}")
+                    print(f"Error queueing data: {e}")
                     self.active_connections.remove(conn)
+
+            # Send all messages concurrently
+            if send_tasks:
+                await asyncio.gather(*send_tasks, return_exceptions=True)
 
     def save_data(self, data: Dict[str, Any]):
         """Save data to file system"""
@@ -171,7 +331,7 @@ class ModelManager:
 
         return Llama(
             model_path=str(model_path),
-            n_ctx=4096,
+            n_ctx=128000,
             n_threads=8,
             n_gpu_layers=1
         )
@@ -258,24 +418,9 @@ class AgentState(TypedDict):
     max_iterations: int
     location: dict
 
-# Agent node implementations with enhanced prompts
-def artistic_director_node(state: AgentState):
-    messages = [
-        SystemMessage(content="""As an artistic director specializing in weather visualization, analyze
-        the provided weather data and create a visual concept using Three.js. Consider elements like color,
-        movement, and form to represent weather conditions effectively.
-        Current weather data: """ + str(state.get('weather_data', {}))),
-        HumanMessage(content=f"Template:\n{state['threejs_template']}\n\nInstruction: {state['artistic_instruction']}")
-    ]
-    response = invoke_llama(messages)
-    return {
-        **state,
-        "messages": state["messages"] + [response],
-        "artistic_interpretation": response.content
-    }
 
-import json
-import re
+
+
 
 def extract_json_from_response(response_text: str) -> dict:
     """Extract and validate JSON content from the model's response."""
@@ -336,6 +481,8 @@ def extract_json_from_response(response_text: str) -> dict:
                     weather_settings[field] = float(weather_settings[field])
                 elif field_type == int:
                     weather_settings[field] = int(weather_settings[field])
+
+
         return weather_settings
 
     except Exception as e:
@@ -361,15 +508,30 @@ def extract_json_from_response(response_text: str) -> dict:
         }
 
 
-
+# Agent node implementations with enhanced prompts
+def artistic_director_node(state: AgentState):
+    messages = [
+        SystemMessage(content="""As an artistic director specializing in weather visualization, analyze 
+        the provided weather data and create a visual concept using Three.js. Consider elements like color, 
+        movement, and form to represent weather conditions effectively.
+        Current weather data: """ + str(state.get('weather_data', {}))),
+        HumanMessage(content=f"Template:\n{state['threejs_template']}\n\nInstruction: {state['artistic_instruction']}")
+    ]
+    response = invoke_llama(messages)
+    return {
+        **state,
+        "messages": state["messages"] + [response],
+        "artistic_interpretation": response.content
+    }
 
 
 
 def prompt_generator_node(state: AgentState):
     messages = [
-        SystemMessage(content="""As a Three.js and JSON technical expert, analyze the weather
-                      conditions and artistic direction to generate precise weather visualization parameters.
-        Your response must contain a weatherSettings object in the exact format shown below:
+        SystemMessage(content="""As a Three.js and JSON technical expert, analyze the weather 
+                      conditions and artistic direction to generate precise weather visualization parameters. 
+        Your response must contain a weatherSettings object in the exact format shown below, while updating the parameter
+                      values to reflect the weather conditions and artistic direction, and never be the same as the previous response, TEMPLATE JSON DATA:
 
         const weatherSettings = {
             fogDensity: 0.0015,            // Range: 0.001 (dense) to 0.006 (clear)
@@ -390,7 +552,7 @@ def prompt_generator_node(state: AgentState):
             cloudColor: 0xffffff           // 0x111111 (dark) to 0xffffff (white)
         };
 
-        Provide only this JSON object in your response, maintaining exact numerical precision and hex color values."""),
+        Provide only this JSON object in your response, maintaing the exact same data types as the previous response, while changing the values to reflect the weather conditions and artistic direction."""),
         HumanMessage(content=f"Based on this artistic direction, generate the appropriate weather settings:\n{state.get('artistic_interpretation', '')}")
     ]
 
@@ -419,14 +581,12 @@ def code_implementer_node(state: AgentState):
         HumanMessage(content=f"Template:\n{state['threejs_template']}\nImplementation requirements:\n{state['generated_prompt']}")
     ]
     response = invoke_llama(messages)
+    print("Code Implementer Response:", response.content)
     new_state = {**state,  # Merge the entire previous state
                  "messages": state["messages"] + [response],
                  "updated_code": response.content,
                  "iteration_count": state.get("iteration_count", 0) + 1}
     return new_state
-
-
-
 
 
 
@@ -448,6 +608,7 @@ def web_researcher_node(state: AgentState):
             f"https://api.open-meteo.com/v1/forecast?latitude={location['lat']}&longitude={location['lon']}&current_weather=true"
         )
         weather_data = response.json()
+        print("Weather Researcher Data:", weather_data)
     except Exception as e:
         weather_data = {"error": str(e)}
     return {
@@ -465,7 +626,7 @@ initial_state = {
     const renderer = new THREE.WebGLRenderer();
     renderer.setSize(window.innerWidth, window.innerHeight);
     document.body.appendChild(renderer.domElement);
-
+    
     function animate() {
         requestAnimationFrame(animate);
         renderer.render(scene, camera);
@@ -513,6 +674,33 @@ builder.add_edge("Web_Researcher", "Artistic_Director")
 # Initialize and start the DataTransmissionManager
 data_transmission_manager = DataTransmissionManager()
 
+async def test_websocket_connection(retries=3, timeout=2):
+    """Test WebSocket connectivity with retries and validation"""
+    # Use model_dump instead of dict
+    test_data = WeatherData().model_dump()
+
+    for attempt in range(retries):
+        try:
+            async with ClientSession() as session:
+                async with session.ws_connect("ws://localhost:8000/ws") as ws:
+                    # Test send/receive
+                    await ws.send_json(test_data)
+
+                    # Verify response within timeout
+                    response = await asyncio.wait_for(ws.receive_json(), timeout)
+                    if response == test_data:
+                        print("✅ WebSocket test successful")
+                        return True
+
+                    print(f"❌ Data mismatch: {response}")
+                    return False
+        except Exception as e:
+            print(f"WebSocket test attempt {attempt+1} failed: {e}")
+            time.sleep(0.5 * (attempt + 1))
+
+    print("❌ All WebSocket connection tests failed")
+    return False
+
 def run_data_transmission_server():
     data_transmission_manager.run_server()
 
@@ -521,48 +709,69 @@ server_thread.daemon = True
 server_thread.start()
 print("DataTransmissionManager server started on http://0.0.0.0:8000")
 
-# Run the agent network
-# Run the agent network
-# Run the agent network
+# Start server with health checks
+print("🚀 Starting server...")
+data_transmission_manager.start()
+
+# Wait for server to start
+time.sleep(1)
+
+# Verify server health
+try:
+    response = requests.get("http://localhost:8000/health", timeout=2)
+    if response.json().get("status") != "ok":
+        print("❌ Server health check failed")
+        exit(1)
+    print("✅ Server health check passed")
+except Exception as e:
+    print(f"❌ Server not responding: {e}")
+    exit(1)
+
+# Run WebSocket test
+loop = asyncio.get_event_loop()
+if not loop.run_until_complete(test_websocket_connection()):
+    print("❌ Critical: WebSocket tests failed, exiting")
+    exit(1)
+
+
+
+
 with SqliteSaver.from_conn_string(":memory:") as checkpointer:
     graph = builder.compile(checkpointer=checkpointer)
     print("Agent network instantiated successfully!")
 
     thread = {"configurable": {"thread_id": "1"}}
-    for s in graph.stream(initial_state, thread):
-        print("Iteration output:", s)
 
-        # Get current weather settings or use defaults
-        current_data = s.get("weather_settings", {
-            "fogDensity": 0.0015,
-            "cameraPosition": {"x": 0, "y": 0, "z": 1},
-            "cameraRotation": {"x": 1.16, "y": -0.12, "z": 0.27},
-            "ambientLightIntensity": 0.1,
-            "directionalLightIntensity": 50,
-            "flashColor": 0x062d89,
-            "flashIntensity": 30,
-            "flashDistance": 10,
-            "flashDecay": 1.7,
-            "rainCount": 10000,
-            "rainColor": 0xaaaaaa,
-            "rainSize": 0.1,
-            "cloudOpacity": 1,
-            "cloudCount": 25,
-            "skyColor": 0x87ceeb,
-            "cloudColor": 0xffffff
-        })
+    async def process_agent_output():
+        for s in graph.stream(initial_state, thread):
+            print("\nNew iteration output:")
+            print(json.dumps(s.get('weather_settings', {}), indent=2))
 
-        # Run the async send_data in the event loop
-        loop = asyncio.get_event_loop()
-        loop.run_until_complete(data_transmission_manager.send_data(current_data))
-        print("Updated weather settings file!")
+            # Check if we have weather settings from the Prompt Generator
+            if "weather_settings" in s and s["weather_settings"]:
+                try:
+                    # Send the new weather data
+                    await data_transmission_manager.send_data(s["weather_settings"])
+                    print("✅ Successfully sent updated weather settings to clients!")
+                except Exception as e:
+                    print(f"❌ Error sending weather data: {e}")
+
+    # Run the agent loop
+    loop = asyncio.get_event_loop()
+    try:
+        loop.run_until_complete(process_agent_output())
+    except KeyboardInterrupt:
+        print("\nShutting down gracefully...")
+    finally:
+        loop.close()
 
 
 
     """for s in graph.stream(initial_state, thread):
         print(s)
-
+        
         # Each time new 'weather_settings' are produced, send them to the DataTransmissionManager
         if "weather_settings" in s and s["weather_settings"]:
             data_transmission_manager.send_data(s["weather_settings"])
             print("Sent updated weather settings to DataTransmissionManager!")"""
+
