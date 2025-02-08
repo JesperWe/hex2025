@@ -21,15 +21,33 @@ import uvicorn
 import asyncio
 from queue import Queue
 import threading
-
+from fastapi.websockets import WebSocketState
 
 class DataTransmissionManager:
     def __init__(self):
         self.app = FastAPI()
         self.setup_cors()
         self.setup_static()
-        self.data_queue = Queue()
-        self.active_connections: List[WebSocket] = []
+        self.latest_data = {
+            "fogDensity": 0.0015,
+            "cameraPosition": {"x": 0, "y": 0, "z": 1},
+            "cameraRotation": {"x": 1.16, "y": -0.12, "z": 0.27},
+            "ambientLightIntensity": 0.1,
+            "directionalLightIntensity": 50,
+            "flashColor": 0x062d89,
+            "flashIntensity": 30,
+            "flashDistance": 10,
+            "flashDecay": 1.7,
+            "rainCount": 10000,
+            "rainColor": 0xaaaaaa,
+            "rainSize": 0.1,
+            "cloudOpacity": 1,
+            "cloudCount": 25,
+            "skyColor": 0x87ceeb,
+            "cloudColor": 0xffffff
+        }
+        self.active_connections = []
+        self.lock = asyncio.Lock()
         self.setup_routes()
 
     def setup_cors(self):
@@ -52,10 +70,10 @@ class DataTransmissionManager:
             await websocket.accept()
             self.active_connections.append(websocket)
             try:
+                # Initial send of current data
+                await websocket.send_json(self.latest_data)
                 while True:
-                    if not self.data_queue.empty():
-                        data = self.data_queue.get()
-                        await websocket.send_json(data)
+                    # Wait for new data instead of sending every second
                     await asyncio.sleep(0.1)
             except Exception as e:
                 print(f"WebSocket error: {e}")
@@ -64,15 +82,23 @@ class DataTransmissionManager:
 
         @self.app.get("/latest")
         async def get_latest_data():
-            if not self.data_queue.empty():
-                return self.data_queue.queue[-1]
-            return {"status": "no data available"}
+            return self.latest_data
 
-    def send_data(self, data: Dict[str, Any]):
-        """Add data to the queue for transmission"""
-        self.data_queue.put(data)
-        # Also save to file for persistence
-        self.save_data(data)
+    async def send_data(self, data: Dict[str, Any]):
+        """Update and broadcast latest data"""
+        async with self.lock:
+            # Merge new data with existing values
+            self.latest_data = {**self.latest_data, **data}
+            self.save_data(self.latest_data)
+
+            # Send to all active connections
+            for conn in self.active_connections.copy():
+                try:
+                    if conn.application_state == WebSocketState.CONNECTED:
+                        await conn.send_json(self.latest_data)
+                except Exception as e:
+                    print(f"Error sending data: {e}")
+                    self.active_connections.remove(conn)
 
     def save_data(self, data: Dict[str, Any]):
         """Save data to file system"""
@@ -243,6 +269,7 @@ def artistic_director_node(state: AgentState):
     ]
     response = invoke_llama(messages)
     return {
+        **state,
         "messages": state["messages"] + [response],
         "artistic_interpretation": response.content
     }
@@ -251,29 +278,37 @@ import json
 import re
 
 def extract_json_from_response(response_text: str) -> dict:
-    """
-    Extract and validate JSON content from the model's response.
-    Returns a cleaned and validated weatherSettings object.
-    """
+    """Extract and validate JSON content from the model's response."""
     try:
-        # Try to find JSON object in the response using regex
-        json_pattern = r'const\s+weatherSettings\s*=\s*({[^;]*});'
-        match = re.search(json_pattern, response_text)
+        # Try to find a JSON code block wrapped in ```json ... ```
+        json_block_pattern = r"```json\s*(\{.*?\})\s*```"
+        match = re.search(json_block_pattern, response_text, re.DOTALL)
+        if match:
+            json_str = match.group(1)
+        else:
+            # Fallback to expecting the pattern: const weatherSettings = { ... };
+            json_pattern = r'const\s+weatherSettings\s*=\s*({[^;]*});'
+            match = re.search(json_pattern, response_text, re.DOTALL)
+            if not match:
+                raise ValueError("No weather settings JSON found in response")
+            json_str = match.group(1)
 
-        if not match:
-            raise ValueError("No weather settings JSON found in response")
-
-        json_str = match.group(1)
-
-        # Remove JavaScript comments
+        # Remove JavaScript comments (if any) and trailing commas
         json_str = re.sub(r'//.*?\n', '\n', json_str)
-        # Remove trailing commas
         json_str = re.sub(r',(\s*[}\]])', r'\1', json_str)
 
-        # Parse the JSON
+        # Convert any hex values (e.g., 0x062d89) to decimal.
+        # This regex finds any occurrence of 0x followed by hexadecimal digits.
+        json_str = re.sub(
+            r'\b0x([0-9a-fA-F]+)\b',
+            lambda m: str(int(m.group(0), 16)),
+            json_str
+        )
+
+        # Now try to parse the JSON.
         weather_settings = json.loads(json_str)
 
-        # Validate required fields and data types
+        # Validate required fields and adjust types as needed.
         required_fields = {
             'fogDensity': float,
             'cameraPosition': dict,
@@ -297,22 +332,15 @@ def extract_json_from_response(response_text: str) -> dict:
             if field not in weather_settings:
                 raise ValueError(f"Missing required field: {field}")
             if not isinstance(weather_settings[field], field_type):
-                # Convert if necessary
                 if field_type == float:
                     weather_settings[field] = float(weather_settings[field])
                 elif field_type == int:
-                    if field.endswith('Color'):
-                        # Handle hex color values
-                        if isinstance(weather_settings[field], str):
-                            weather_settings[field] = int(weather_settings[field].replace('0x', ''), 16)
-                    else:
-                        weather_settings[field] = int(weather_settings[field])
-
+                    weather_settings[field] = int(weather_settings[field])
         return weather_settings
 
     except Exception as e:
         print(f"Error parsing JSON response: {e}")
-        # Return default weather settings if parsing fails
+        # Return enhanced default with all required fields
         return {
             "fogDensity": 0.0015,
             "cameraPosition": {"x": 0, "y": 0, "z": 1},
@@ -331,6 +359,11 @@ def extract_json_from_response(response_text: str) -> dict:
             "skyColor": 0x87ceeb,
             "cloudColor": 0xffffff
         }
+
+
+
+
+
 
 def prompt_generator_node(state: AgentState):
     messages = [
@@ -369,32 +402,41 @@ def prompt_generator_node(state: AgentState):
     # Format the response as a proper JSON string
     formatted_json = json.dumps(weather_settings, indent=2)
 
+    print("Prompt Generator Response:", formatted_json)
+
     return {
+        **state,  # Preserve all existing state
         "messages": state["messages"] + [response],
         "generated_prompt": formatted_json,
-        "weather_settings": weather_settings  # Add the parsed settings to the state
+        "weather_settings": weather_settings
     }
 
 
 
 def code_implementer_node(state: AgentState):
     messages = [
-        SystemMessage(content="""As a Three.js developer, implement the technical requirements
-        in clean, efficient code. Ensure proper scene setup, optimized rendering, and smooth animations.
-        Include error handling and performance considerations."""),
+        SystemMessage(content="As a Three.js developer, implement the technical requirements in clean, efficient code. Ensure proper scene setup, optimized rendering, and smooth animations. Include error handling and performance considerations."),
         HumanMessage(content=f"Template:\n{state['threejs_template']}\nImplementation requirements:\n{state['generated_prompt']}")
     ]
     response = invoke_llama(messages)
-    return {
-        "messages": state["messages"] + [response],
-        "updated_code": response.content,
-        "iteration_count": state.get("iteration_count", 0) + 1
-    }
+    new_state = {**state,  # Merge the entire previous state
+                 "messages": state["messages"] + [response],
+                 "updated_code": response.content,
+                 "iteration_count": state.get("iteration_count", 0) + 1}
+    return new_state
+
+
+
+
+
+
+
 
 def validation_node(state: AgentState):
     errors = validate_threejs_code(state['updated_code'])
     validation_success = not errors and run_threejs_test(state['updated_code'])
     return {
+        **state,
         "validation_errors": [] if validation_success else errors + ["Runtime validation failed"],
         "messages": state["messages"]
     }
@@ -409,6 +451,7 @@ def web_researcher_node(state: AgentState):
     except Exception as e:
         weather_data = {"error": str(e)}
     return {
+        **state,  # Preserve all existing state
         "weather_data": weather_data,
         "messages": state["messages"]
     }
@@ -445,24 +488,24 @@ builder = StateGraph(AgentState)
 builder.add_node("Artistic_Director", artistic_director_node)
 builder.add_node("Prompt_Generator", prompt_generator_node)
 builder.add_node("Code_Implementer", code_implementer_node)
-builder.add_node("Validator", validation_node)
+#builder.add_node("Validator", validation_node)
 builder.add_node("Web_Researcher", web_researcher_node)
 
 # Set entry point and configure edges
 builder.set_entry_point("Artistic_Director")
 builder.add_edge("Artistic_Director", "Prompt_Generator")
 builder.add_edge("Prompt_Generator", "Code_Implementer")
-builder.add_edge("Code_Implementer", "Validator")
+builder.add_edge("Code_Implementer", "Web_Researcher")
 
 # Add conditional edges
-builder.add_conditional_edges(
+"""builder.add_conditional_edges(
     "Validator",
     lambda state: "continue" if state.get("validation_errors") and state.get("iteration_count", 0) < state.get("max_iterations", 5) else "complete",
     {
         "continue": "Code_Implementer",
         "complete": "Web_Researcher"
     }
-)
+)"""
 
 builder.add_edge("Web_Researcher", "Artistic_Director")
 
@@ -479,15 +522,47 @@ server_thread.start()
 print("DataTransmissionManager server started on http://0.0.0.0:8000")
 
 # Run the agent network
+# Run the agent network
+# Run the agent network
 with SqliteSaver.from_conn_string(":memory:") as checkpointer:
     graph = builder.compile(checkpointer=checkpointer)
     print("Agent network instantiated successfully!")
 
     thread = {"configurable": {"thread_id": "1"}}
     for s in graph.stream(initial_state, thread):
+        print("Iteration output:", s)
+
+        # Get current weather settings or use defaults
+        current_data = s.get("weather_settings", {
+            "fogDensity": 0.0015,
+            "cameraPosition": {"x": 0, "y": 0, "z": 1},
+            "cameraRotation": {"x": 1.16, "y": -0.12, "z": 0.27},
+            "ambientLightIntensity": 0.1,
+            "directionalLightIntensity": 50,
+            "flashColor": 0x062d89,
+            "flashIntensity": 30,
+            "flashDistance": 10,
+            "flashDecay": 1.7,
+            "rainCount": 10000,
+            "rainColor": 0xaaaaaa,
+            "rainSize": 0.1,
+            "cloudOpacity": 1,
+            "cloudCount": 25,
+            "skyColor": 0x87ceeb,
+            "cloudColor": 0xffffff
+        })
+
+        # Run the async send_data in the event loop
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(data_transmission_manager.send_data(current_data))
+        print("Updated weather settings file!")
+
+
+
+    """for s in graph.stream(initial_state, thread):
         print(s)
 
         # Each time new 'weather_settings' are produced, send them to the DataTransmissionManager
         if "weather_settings" in s and s["weather_settings"]:
             data_transmission_manager.send_data(s["weather_settings"])
-            print("Sent updated weather settings to DataTransmissionManager!")
+            print("Sent updated weather settings to DataTransmissionManager!")"""
